@@ -69,6 +69,42 @@ def next_friday_scheduling_after(time):
     return candidate
 
 
+def next_office_time_at_or_after(time):
+    t = time
+
+    while True:
+        day = int(math.floor(t / 24))
+        h = t % 24
+
+        # weekday before office hours
+        if day % 7 <= 4 and h < 8:
+            return day * 24 + 8
+
+        # weekday during office hours
+        if day % 7 <= 4 and 8 <= h < 16:
+            return t
+
+        # otherwise go to next day 08:00
+        t = (day + 1) * 24 + 8
+
+
+def add_office_hours(start_time, gap):
+    # add a time gap, but only count weekday office hours
+    t = next_office_time_at_or_after(start_time)
+    remaining = gap
+
+    while True:
+        day = int(math.floor(t / 24))
+        end_of_office_day = day * 24 + 16
+        available_today = end_of_office_day - t
+
+        if remaining <= available_today:
+            return t + remaining
+
+        remaining -= available_today
+        t = next_office_time_at_or_after(end_of_office_day + 1e-9)
+
+
 @dataclass
 # for one patient
 class Patient:
@@ -352,6 +388,62 @@ def try_start_scan(sim, state):
         state.update_time_weighted_statistics(sim.current_time)
 
 
+# confidence interval functions
+
+def mean(values):
+    return sum(values) / len(values)
+
+
+def sample_standard_deviation(values):
+    n = len(values)
+
+    if n < 2:
+        return 0.0
+
+    m = mean(values)
+
+    total = 0.0
+
+    for x in values:
+        total += (x - m) ** 2
+
+    return math.sqrt(total / (n - 1))
+
+
+def confidence_interval_95(values):
+    n = len(values)
+    m = mean(values)
+
+    if n < 2:
+        return {
+            "mean": m,
+            "lower": m,
+            "upper": m,
+            "half_width": 0.0,
+            "relative_precision": float("inf")
+        }
+
+    s = sample_standard_deviation(values)
+
+    # normal approximation for 95% confidence interval
+    z_value = 1.96
+
+    half_width = z_value * s / math.sqrt(n)
+
+    if abs(m) < 1e-12:
+        relative_precision = float("inf")
+    else:
+        relative_precision = half_width / abs(m)
+
+    return {
+        "mean": m,
+        "lower": m - half_width,
+        "upper": m + half_width,
+        "half_width": half_width,
+        "relative_precision": relative_precision
+    }
+
+
 # defining an emergency arrival event
 class EmergencyArrival(Event):
 
@@ -467,8 +559,10 @@ class OutpatientRequest(Event):
             )
 
         # schedule next outpatient request
+        # outpatient calls are generated only during weekday office hours
         gap = self.state.outpatient_request_gap()
-        sim.schedule(OutpatientRequest(sim.current_time + gap, n + 1, self.state))
+        next_time = add_office_hours(sim.current_time, gap)
+        sim.schedule(OutpatientRequest(next_time, n + 1, self.state))
 
 
 # defining an outpatient physical arrival event
@@ -572,12 +666,28 @@ class CapacityChange(Event):
         sim.schedule(CapacityChange(next_change, self.state))
 
 
+def safe_mean(sample_statistic):
+    # in case a statistic has no observations
+    try:
+        value = sample_statistic.mean()
+    except ZeroDivisionError:
+        return 0.0
+
+    if value is None:
+        return 0.0
+
+    return value
+
+
 def run_scenario(
     emergency_rate,
     inpatient_rate,
     outpatient_request_rate,
-    num_weeks
+    num_weeks,
+    verbose=False
 ):
+    # this runs ONE replication
+
     sim = Simulation()
 
     state = CTState(
@@ -589,7 +699,10 @@ def run_scenario(
     # schedule first arrivals
     sim.schedule(EmergencyArrival(state.emergency_arrival_gap(), 1, state))
     sim.schedule(InpatientArrival(state.inpatient_arrival_gap(), 1, state))
-    sim.schedule(OutpatientRequest(state.outpatient_request_gap(), 1, state))
+
+    # first outpatient request is generated during office hours
+    first_outpatient_time = add_office_hours(0, state.outpatient_request_gap())
+    sim.schedule(OutpatientRequest(first_outpatient_time, 1, state))
 
     # schedule first capacity change
     sim.schedule(CapacityChange(next_capacity_change_after(0), state))
@@ -603,42 +716,135 @@ def run_scenario(
     sim.run(stop_condition=lambda sim: sim.current_time >= end_time)
 
     T = sim.current_time
+
+    # final update for time weighted statistics
     state.update_time_weighted_statistics(T)
 
+    # return the result of this one replication
+    results = {
+        "office_utilisation": state.office_utilisation(),
+        "outside_utilisation": state.outside_utilisation(),
+
+        # waiting times are stored in hours, so multiply by 60 for minutes
+        "emergency_waiting_time_minutes": safe_mean(state.emergency_waiting_time) * 60,
+        "outpatient_waiting_time_minutes": safe_mean(state.outpatient_waiting_time) * 60,
+
+        # outpatient access time was recorded in days
+        "outpatient_access_time_days": safe_mean(state.outpatient_access_time),
+
+        "fraction_waited_outside": state.fraction_waited_outside(),
+        "fraction_inpatients_missed_same_day": state.fraction_inpatients_missed_same_day()
+    }
+
+    # verbose version
+    if verbose:
+        print("\n===================================")
+        print("Results for one replication")
+        print("===================================")
+
+        for key, value in results.items():
+            print(key, ":", value)
+
+    return results
+
+
+def run_experiment(
+    emergency_rate,
+    inpatient_rate,
+    outpatient_request_rate,
+    num_weeks,
+    min_replications=30,
+    max_replications=500,
+    batch_size=10,
+    target_relative_precision=0.10
+):
+    # this stores the result from every replication
+
+    all_results = {
+        "office_utilisation": [],
+        "outside_utilisation": [],
+        "emergency_waiting_time_minutes": [],
+        "outpatient_waiting_time_minutes": [],
+        "outpatient_access_time_days": [],
+        "fraction_waited_outside": [],
+        "fraction_inpatients_missed_same_day": []
+    }
+
+    num_replications = 0
+
+    while num_replications < max_replications:
+
+        # do not run beyond max_replications
+        reps_to_run = min(batch_size, max_replications - num_replications)
+
+        # run a small batch of replications
+        for _ in range(reps_to_run):
+            replication_result = run_scenario(
+                emergency_rate=emergency_rate,
+                inpatient_rate=inpatient_rate,
+                outpatient_request_rate=outpatient_request_rate,
+                num_weeks=num_weeks,
+                verbose=False
+            )
+
+            for key in all_results:
+                all_results[key].append(replication_result[key])
+
+            num_replications += 1
+
+        # do not check precision too early
+        if num_replications < min_replications:
+            continue
+
+        # calculate confidence intervals
+        summary = {}
+
+        for key in all_results:
+            summary[key] = confidence_interval_95(all_results[key])
+
+        # check if all measures have 10% relative precision
+        all_precise_enough = True
+
+        for key in summary:
+            relative_precision = summary[key]["relative_precision"]
+
+            if relative_precision > target_relative_precision:
+                all_precise_enough = False
+                break
+
+        if all_precise_enough:
+            break
+
     print("\n===================================")
-    print("Results for current CT simulation")
+    print("Simulation results")
     print("===================================")
+    print("Number of replications:", num_replications)
+    print()
 
-    print("Simulation time:", T)
-    print("Completed patients:", state.total_completed.value)
+    for key in all_results:
+        ci = confidence_interval_95(all_results[key])
 
-    print("Office-hour scanner utilisation:", state.office_utilisation())
-    print("Outside-office scanner utilisation:", state.outside_utilisation())
+        print(key)
+        print("  mean:", ci["mean"])
+        print("  95% CI:", "[", ci["lower"], ",", ci["upper"], "]")
+        print("  half-width:", ci["half_width"])
+        print("  relative precision:", ci["relative_precision"])
+        print()
 
-    print("Average emergency waiting time:", state.emergency_waiting_time.mean())
-    print("Average outpatient waiting time:", state.outpatient_waiting_time.mean())
-    print("Average outpatient access time in days:", state.outpatient_access_time.mean())
-
-    print("Fraction waited outside:", state.fraction_waited_outside())
-
-    print(
-        "Fraction office-hour inpatients missed same-day target:",
-        state.fraction_inpatients_missed_same_day()
-    )
-
-    print("Average number waiting:", state.waiting_room_size_over_time.mean(T))
-
-    return state
+    return all_results
 
 
 if __name__ == "__main__":
 
-    # example rates per hour
-    # replace these with the project values
+    # todo: put the right rates instead of placeholder
 
-    run_scenario(
+    run_experiment(
         emergency_rate=1.0,
         inpatient_rate=0.3,
-        outpatient_request_rate=1.0,
-        num_weeks=10
+        outpatient_request_rate=23 / 8,
+        num_weeks=10,
+        min_replications=30,
+        max_replications=3000,
+        batch_size=10,
+        target_relative_precision=0.10
     )
